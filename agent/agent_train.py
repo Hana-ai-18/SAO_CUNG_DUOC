@@ -21,7 +21,7 @@ try:
                                      TILE_ITEM_RAD, TILE_ITEM_CAP)
 except ImportError:
     from network import BomberNet
-    from state_encoder import (encode_state, ACTION_STOP, ACTION_LEFT,
+    from utils.state_encoder import (encode_state, ACTION_STOP, ACTION_LEFT,
                                 ACTION_RIGHT, ACTION_UP, ACTION_DOWN,
                                 ACTION_BOMB, MOVE_DELTAS,
                                 TILE_WALL, TILE_BOX, TILE_GRASS,

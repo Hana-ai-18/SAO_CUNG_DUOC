@@ -185,3 +185,5 @@ def _count_destroyable(board, pos, blast, H, W):
                 count += 1
                 break
     return count
+
+

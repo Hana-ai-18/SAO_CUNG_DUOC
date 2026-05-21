@@ -15,7 +15,7 @@ from typing import List
 
 from agent.network import BomberNet
 from utils.state_encoder import encode_state
-from agent.agent import compute_action_mask
+from agent.agent_train import compute_action_mask
 
 
 @dataclass
