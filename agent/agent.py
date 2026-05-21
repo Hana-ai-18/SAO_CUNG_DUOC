@@ -1,240 +1,282 @@
 """
-agent.py  (file nộp thi)
-------------------------
-Agent kết hợp:
-  1. Neural network (PPO trained) – chiến thuật cao cấp
-  2. Safety layer rule-based – phản xạ thoát bom tức thời
-  3. Hybrid decision: nếu nguy hiểm → rule-based override,
-                      ngược lại    → neural policy
-
-Cách dùng:
-    agent = BomITAgent(model_path="checkpoints/agent_final.pt")
-    action = agent.act(obs)
+agent.py  –  File NỘP THI (đúng interface BTC)
+------------------------------------------------
+class Agent:
+    def __init__(self, agent_id: int)
+    def act(self, obs: dict) -> int   # trả về 0-5
 """
 
 import os
-import torch
 import numpy as np
-from collections import deque
+import torch
 from typing import Optional
 
-from agent.network import BomberNet
-from utils.state_encoder import encode_state, TILE_WALL, TILE_CRATE, TILE_EMPTY
+# Import tương đối (khi chạy standalone từ zip)
+try:
+    from agent.network import BomberNet
+    from utils.state_encoder import (encode_state, ACTION_STOP, ACTION_LEFT,
+                                     ACTION_RIGHT, ACTION_UP, ACTION_DOWN,
+                                     ACTION_BOMB, MOVE_DELTAS,
+                                     TILE_WALL, TILE_BOX, TILE_GRASS,
+                                     TILE_ITEM_RAD, TILE_ITEM_CAP)
+except ImportError:
+    from network import BomberNet
+    from state_encoder import (encode_state, ACTION_STOP, ACTION_LEFT,
+                                ACTION_RIGHT, ACTION_UP, ACTION_DOWN,
+                                ACTION_BOMB, MOVE_DELTAS,
+                                TILE_WALL, TILE_BOX, TILE_GRASS,
+                                TILE_ITEM_RAD, TILE_ITEM_CAP)
 
 
-# ── Hằng số hành động (điều chỉnh theo engine) ─────────────────────────────
-ACTION_STOP  = 0
-ACTION_UP    = 1
-ACTION_DOWN  = 2
-ACTION_LEFT  = 3
-ACTION_RIGHT = 4
-ACTION_BOMB  = 5
-
-MOVE_DELTAS = {
-    ACTION_UP:    (-1,  0),
-    ACTION_DOWN:  ( 1,  0),
-    ACTION_LEFT:  ( 0, -1),
-    ACTION_RIGHT: ( 0,  1),
-}
-
+# ── Safety Layer ──────────────────────────────────────────────────────────────
 
 class SafetyLayer:
     """
-    Rule-based safety: thoát vùng nguy hiểm bằng BFS tìm ô an toàn gần nhất.
-    Chạy trước neural policy; nếu agent đang trong tầm nổ → override hành động.
+    BFS tìm đường thoát khỏi vùng nguy hiểm.
+    Override neural policy khi đang trong tầm nổ.
     """
-
-    DANGER_THRESHOLD = 0.4
+    DANGER_THRESH = 0.30   # timer <= ~5/7 → nguy hiểm
 
     def safe_action(self, obs: dict, agent_id: int) -> Optional[int]:
-        board   = np.array(obs['board'])
+        board   = np.array(obs['map'],     dtype=np.int32)
+        players = np.array(obs['players'], dtype=np.int32)
+        bombs   = np.array(obs['bombs'],   dtype=np.int32)
         H, W    = board.shape
-        pos     = tuple(obs['agents'][agent_id]['position'])
+        pos     = (int(players[agent_id][0]), int(players[agent_id][1]))
 
         # Xây danger map
-        danger  = np.zeros((H, W), dtype=np.float32)
-        for bomb in obs.get('bombs', []):
-            r, c  = bomb['position']
-            timer = bomb.get('timer', 5)
-            blast = bomb.get('blast_strength', 3)
-            urgency = 1.0 - timer / 10.0
-            danger[r][c] = max(danger[r][c], urgency)
-            for dr, dc in [(0,1),(0,-1),(1,0),(-1,0)]:
-                for step in range(1, blast + 1):
-                    nr, nc = r + dr * step, c + dc * step
-                    if not (0 <= nr < H and 0 <= nc < W):
-                        break
-                    if board[nr][nc] == TILE_WALL:
-                        break
-                    danger[nr][nc] = max(danger[nr][nc], urgency * 0.9)
+        danger = np.zeros((H, W), dtype=np.float32)
+        if bombs.ndim == 2 and len(bombs) > 0:
+            for b in bombs:
+                br, bc, timer, owner = int(b[0]), int(b[1]), int(b[2]), int(b[3])
+                owner_bonus = int(players[owner][4]) if 0 <= owner < 4 else 0
+                blast   = 1 + owner_bonus
+                urgency = 1.0 - min(timer, 7) / 7.0
+                danger[br][bc] = max(danger[br][bc], urgency)
+                for dr, dc in [(-1,0),(1,0),(0,-1),(0,1)]:
+                    for step in range(1, blast+1):
+                        nr, nc = br+dr*step, bc+dc*step
+                        if not (0 <= nr < H and 0 <= nc < W):
+                            break
+                        if board[nr][nc] == TILE_WALL:
+                            break
+                        danger[nr][nc] = max(danger[nr][nc], urgency * 0.9)
+                        if board[nr][nc] == TILE_BOX:
+                            break
 
-        for flame in obs.get('flames', []):
-            fr, fc = flame['position']
-            danger[fr][fc] = 1.0
-
-        if danger[pos[0]][pos[1]] < self.DANGER_THRESHOLD:
-            return None  # an toàn, để neural policy quyết định
+        if danger[pos[0]][pos[1]] < self.DANGER_THRESH:
+            return None   # an toàn → để neural quyết định
 
         # BFS tìm ô an toàn gần nhất
-        from collections import deque as dq
-        queue   = dq([(pos, [])])
+        from collections import deque
+        queue   = deque([(pos, [])])
         visited = {pos}
-
         while queue:
             (r, c), path = queue.popleft()
-            if danger[r][c] < self.DANGER_THRESHOLD and (r, c) != pos:
-                # trả về hành động đầu tiên trong path
+            if danger[r][c] < self.DANGER_THRESH and (r, c) != pos:
                 return path[0] if path else ACTION_STOP
+            for act, (dr, dc) in MOVE_DELTAS.items():
+                nr, nc = r+dr, c+dc
+                if (0 <= nr < H and 0 <= nc < W
+                        and board[nr][nc] not in [TILE_WALL, TILE_BOX]
+                        and (nr, nc) not in visited):
+                    # Tránh đi vào ô có bom đã tồn tại (theo rule BTC)
+                    if not _has_existing_bomb(bombs, nr, nc):
+                        visited.add((nr, nc))
+                        queue.append(((nr, nc), path + [act]))
 
-            for action, (dr, dc) in MOVE_DELTAS.items():
-                nr, nc = r + dr, c + dc
-                if (0 <= nr < H and 0 <= nc < W and
-                        board[nr][nc] not in [TILE_WALL, TILE_CRATE] and
-                        (nr, nc) not in visited):
-                    visited.add((nr, nc))
-                    queue.append(((nr, nc), path + [action]))
+        return ACTION_STOP
 
-        return ACTION_STOP  # không tìm được đường → đứng yên
 
+def _has_existing_bomb(bombs, r, c):
+    if bombs.ndim == 2 and len(bombs) > 0:
+        for b in bombs:
+            if int(b[0]) == r and int(b[1]) == c:
+                return True
+    return False
+
+
+# ── Bomb Decision Layer ───────────────────────────────────────────────────────
 
 class BombDecisionLayer:
     """
-    Quyết định có nên đặt bom không (override thêm).
-    Tránh đặt bom tự sát = vừa đặt bom vừa không có đường thoát.
+    Kiểm tra xem có nên đặt bom không.
+    Từ chối nếu: không có đường thoát sau khi đặt bom.
     """
+    MIN_EXITS = 1
+
     def should_bomb(self, obs: dict, agent_id: int) -> bool:
-        board = np.array(obs['board'])
-        H, W  = board.shape
-        pos   = tuple(obs['agents'][agent_id]['position'])
-        blast = obs['agents'][agent_id].get('blast_strength', 2)
+        board   = np.array(obs['map'],     dtype=np.int32)
+        players = np.array(obs['players'], dtype=np.int32)
+        bombs   = np.array(obs['bombs'],   dtype=np.int32)
+        H, W    = board.shape
 
-        # Kiểm tra: sau khi đặt bom, có ô thoát không?
-        # Giả lập bom tại pos
-        safe_exits = self._count_safe_exits(board, pos, blast, H, W)
-        return safe_exits >= 1
+        me           = players[agent_id]
+        bombs_left   = int(me[3])
+        radius_bonus = int(me[4])
+        blast        = 1 + radius_bonus
+        pos          = (int(me[0]), int(me[1]))
 
-    def _count_safe_exits(self, board, pos, blast, H, W):
-        from collections import deque as dq
-        r0, c0 = pos
-        # Tính vùng nổ
+        if bombs_left <= 0:
+            return False
+
+        # Tính blast zone nếu đặt bom tại pos
         blast_zone = {pos}
-        for dr, dc in [(0,1),(0,-1),(1,0),(-1,0)]:
-            for step in range(1, blast + 1):
-                nr, nc = r0 + dr * step, c0 + dc * step
+        for dr, dc in [(-1,0),(1,0),(0,-1),(0,1)]:
+            for step in range(1, blast+1):
+                nr, nc = pos[0]+dr*step, pos[1]+dc*step
                 if not (0 <= nr < H and 0 <= nc < W):
                     break
                 if board[nr][nc] == TILE_WALL:
                     break
                 blast_zone.add((nr, nc))
+                if board[nr][nc] == TILE_BOX:
+                    break
 
-        # BFS thoát ra ngoài blast_zone trong 3 bước
-        queue   = dq([(pos, 0)])
+        # BFS tìm ô thoát khỏi blast_zone trong 7 bước (timer=7)
+        from collections import deque
+        queue   = deque([(pos, 0)])
         visited = {pos}
         exits   = 0
         while queue:
             (r, c), steps = queue.popleft()
             if (r, c) not in blast_zone:
                 exits += 1
-                if exits >= 1:
-                    return exits
-            if steps >= 3:
+                if exits >= self.MIN_EXITS:
+                    return True
+            if steps >= 7:
                 continue
             for dr, dc in MOVE_DELTAS.values():
-                nr, nc = r + dr, c + dc
-                if (0 <= nr < H and 0 <= nc < W and
-                        board[nr][nc] == TILE_EMPTY and
-                        (nr, nc) not in visited):
+                nr, nc = r+dr, c+dc
+                if (0 <= nr < H and 0 <= nc < W
+                        and board[nr][nc] not in [TILE_WALL, TILE_BOX]
+                        and not _has_existing_bomb(bombs, nr, nc)
+                        and (nr, nc) not in visited):
                     visited.add((nr, nc))
-                    queue.append(((nr, nc), steps + 1))
-        return exits
+                    queue.append(((nr, nc), steps+1))
+        return exits >= self.MIN_EXITS
 
 
-# ── Main Agent ────────────────────────────────────────────────────────────────
+# ── Action Mask ───────────────────────────────────────────────────────────────
 
-class BomITAgent:
+def compute_action_mask(obs: dict, agent_id: int) -> torch.Tensor:
     """
-    Agent kết hợp Neural Policy + Safety Rules.
+    Trả về BoolTensor (1, 6): True = action không hợp lệ.
+    Mask:
+      - Đi vào tường/box/bom cũ
+      - Đặt bom khi bombs_left=0 hoặc đang đứng trên bom
+    """
+    board   = np.array(obs['map'],     dtype=np.int32)
+    players = np.array(obs['players'], dtype=np.int32)
+    bombs   = np.array(obs['bombs'],   dtype=np.int32)
+    H, W    = board.shape
 
-    Parameters
-    ----------
-    model_path : đường dẫn đến file .pt đã train
-    agent_id   : id của agent mình trên bản đồ (0-3)
-    device     : 'cpu' hoặc 'cuda'
+    me         = players[agent_id]
+    r, c       = int(me[0]), int(me[1])
+    bombs_left = int(me[3])
+
+    mask = [False] * 6   # False = hợp lệ
+
+    # Mask hành động di chuyển
+    for act, (dr, dc) in MOVE_DELTAS.items():
+        nr, nc = r+dr, c+dc
+        if not (0 <= nr < H and 0 <= nc < W):
+            mask[act] = True
+        elif board[nr][nc] in [TILE_WALL, TILE_BOX]:
+            mask[act] = True
+        elif _has_existing_bomb(bombs, nr, nc):
+            # Không đi vào ô có bom đã tồn tại
+            # (trừ ô mình đang đứng - nhưng mình chỉ check ô mới)
+            mask[act] = True
+
+    # Mask đặt bom
+    if bombs_left <= 0 or _has_existing_bomb(bombs, r, c):
+        mask[ACTION_BOMB] = True
+
+    return torch.tensor([mask], dtype=torch.bool)   # (1,6)
+
+
+# ── Main Agent (BTC interface) ────────────────────────────────────────────────
+
+class Agent:
+    """
+    Interface chính xác theo yêu cầu BTC.
+    File này đặt trong ZIP cùng model.pth.
     """
 
-    def __init__(self, model_path: Optional[str] = None,
-                 agent_id: int = 0, device: str = "cpu"):
-        self.agent_id    = agent_id
-        self.device      = torch.device(device)
-        self.net         = BomberNet().to(self.device)
-        self.safety      = SafetyLayer()
-        self.bomb_decide = BombDecisionLayer()
+    MODEL_FILE = 'model.pth'   # tên file model trong ZIP
 
-        if model_path and os.path.exists(model_path):
+    def __init__(self, agent_id: int):
+        self.agent_id   = agent_id
+        self.device     = torch.device('cpu')   # máy chấm không có GPU
+        self.net        = BomberNet().to(self.device)
+        self.safety     = SafetyLayer()
+        self.bomb_check = BombDecisionLayer()
+
+        # Load model từ cùng thư mục với agent.py
+        base_dir   = os.path.dirname(os.path.abspath(__file__))
+        model_path = os.path.join(base_dir, self.MODEL_FILE)
+        if os.path.exists(model_path):
             ckpt = torch.load(model_path, map_location=self.device)
-            self.net.load_state_dict(ckpt['model'])
-            print(f"✅ Model loaded: {model_path}")
+            # hỗ trợ cả 2 format: dict có 'model' key, hoặc raw state_dict
+            state = ckpt.get('model', ckpt)
+            self.net.load_state_dict(state)
+            print(f'[Agent {agent_id}] Model loaded: {model_path}')
         else:
-            print("⚠️  Không tìm thấy model, dùng random weights (cần train trước!)")
+            print(f'[Agent {agent_id}] WARNING: model.pth not found, using random weights')
 
         self.net.eval()
 
     def act(self, obs: dict) -> int:
         """
-        Trả về action int cho 1 bước.
-
-        Parameters
-        ----------
-        obs : dict quan sát từ env.step() / env.reset() cho agent này
-
-        Returns
-        -------
-        int : action (0-5)
+        Phải trả về trong 100ms (yêu cầu BTC).
+        Pipeline: Safety → Neural (+ action mask) → Bomb check
         """
-        # 1. Safety layer – kiểm tra nguy hiểm
-        safe_action = self.safety.safe_action(obs, self.agent_id)
-        if safe_action is not None:
-            return safe_action
+        # 1. Safety override khi đang trong tầm nổ
+        safe_act = self.safety.safe_action(obs, self.agent_id)
+        if safe_act is not None:
+            return safe_act
 
-        # 2. Neural policy
+        # 2. Neural policy với action mask
         sp, sc = encode_state(obs, self.agent_id)
-        sp = sp.unsqueeze(0).to(self.device)
-        sc = sc.unsqueeze(0).to(self.device)
+        sp_d   = sp.unsqueeze(0).to(self.device)
+        sc_d   = sc.unsqueeze(0).to(self.device)
+        mask   = compute_action_mask(obs, self.agent_id).to(self.device)
 
-        action, _, _, _ = self.net.get_action(sp, sc, deterministic=False)
+        action, _, _, _ = self.net.get_action(sp_d, sc_d, mask=mask)
 
-        # 3. Bomb safety check: nếu neural chọn đặt bom → kiểm tra tự sát
+        # 3. Nếu chọn BOMB → kiểm tra tự sát
         if action == ACTION_BOMB:
-            if not self.bomb_decide.should_bomb(obs, self.agent_id):
-                # Không đặt bom, chọn di chuyển tốt nhất thay thế
+            if not self.bomb_check.should_bomb(obs, self.agent_id):
+                # Mask bom rồi chọn lại
                 with torch.no_grad():
-                    logits, _ = self.net(sp, sc)
-                logits[0][ACTION_BOMB] = -1e9   # mask bom
-                action = logits.argmax(dim=-1).item()
+                    logits, _ = self.net(sp_d, sc_d)
+                mask_bomb         = mask.clone()
+                mask_bomb[0][ACTION_BOMB] = True
+                logits = logits.masked_fill(mask_bomb, -1e9)
+                action = logits.argmax(-1).item()
 
-        return action
+        return int(action)
 
 
-# ── Dùng thử không có env (smoke test) ─────────────────────────────────────
-if __name__ == "__main__":
-    # Tạo obs giả để test import
+# ── Smoke test ────────────────────────────────────────────────────────────────
+if __name__ == '__main__':
+    board = np.zeros((13, 13), dtype=np.int32)
+    # Thêm tường viền
+    board[0, :] = board[12, :] = board[:, 0] = board[:, 12] = 1
+
     fake_obs = {
-        'board': np.zeros((13, 13), dtype=int),
-        'bombs': [],
-        'flames': [],
-        'items': [],
-        'agents': [
-            {'position': (1, 1), 'alive': True, 'bomb_count': 1,
-             'blast_strength': 2, 'can_kick': 0},
-            {'position': (1, 11), 'alive': True, 'bomb_count': 1,
-             'blast_strength': 2, 'can_kick': 0},
-            {'position': (11, 1), 'alive': True, 'bomb_count': 1,
-             'blast_strength': 2, 'can_kick': 0},
-            {'position': (11, 11), 'alive': True, 'bomb_count': 1,
-             'blast_strength': 2, 'can_kick': 0},
-        ],
+        'map'    : board,
+        'players': np.array([
+            [1, 1,  1, 1, 0],
+            [11,11, 1, 1, 0],
+            [1, 11, 1, 1, 0],
+            [11, 1, 1, 1, 0],
+        ], dtype=np.int32),
+        'bombs'  : np.zeros((0, 4), dtype=np.int32),
     }
 
-    agent  = BomITAgent(agent_id=0)
+    agent  = Agent(agent_id=0)
     action = agent.act(fake_obs)
-    print(f"✅ Smoke test passed | Action: {action}")
+    names  = ['STOP','LEFT','RIGHT','UP','DOWN','BOMB']
+    print(f'Smoke test OK → action={action} ({names[action]})')

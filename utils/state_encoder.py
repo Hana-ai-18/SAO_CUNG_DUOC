@@ -1,158 +1,187 @@
 """
-state_encoder.py
-----------------
-Chuyển đổi trạng thái game thô sang tensor đầu vào cho mạng neural.
-
-Chiến lược: dùng 3 kênh (channels) riêng biệt như ảnh RGB:
-  - Kênh bản đồ tĩnh  : tường, thùng, đường trống
-  - Kênh nguy hiểm    : bom, lửa, timer nổ
-  - Kênh thực thể      : agent mình, agent địch, vật phẩm
-
-Ngoài ra có vector scalar bổ sung (stats của agent).
+state_encoder.py  –  khớp đúng format obs của BTC
+--------------------------------------------------
+obs = {
+    "map":     np.ndarray (13,13)  0=Grass,1=Wall,2=Box,3=Item_Radius,4=Item_Capacity
+    "players": np.ndarray (4,5)    [row, col, alive, bombs_left, bomb_radius_bonus]
+    "bombs":   np.ndarray (N,4)    [row, col, timer, owner_id]
+}
+Actions: 0=STOP 1=LEFT 2=RIGHT 3=UP 4=DOWN 5=PLACE_BOMB
 """
 
 import numpy as np
 import torch
 
+# ── Hằng số map ──────────────────────────────────────────────────────────────
+TILE_GRASS    = 0
+TILE_WALL     = 1
+TILE_BOX      = 2
+TILE_ITEM_RAD = 3
+TILE_ITEM_CAP = 4
 
-# ───────────────────────────────────────────────
-# Hằng số bản đồ (điều chỉnh theo engine BomIT)
-# ───────────────────────────────────────────────
-TILE_EMPTY  = 0
-TILE_WALL   = 1   # tường cứng, không phá được
-TILE_CRATE  = 2   # thùng gỗ, phá bằng bom
-TILE_BOMB   = 3
-TILE_FIRE   = 4
-TILE_ITEM_BLAST  = 5   # vật phẩm tăng sức nổ
-TILE_ITEM_SPEED  = 6   # vật phẩm tăng tốc
-TILE_ITEM_BOMB   = 7   # vật phẩm thêm bom
-TILE_AGENT_SELF  = 8
-TILE_AGENT_ENEMY = 9
+GRID   = 13
+N_CH   = 9     # số kênh feature map
+SCALAR = 9     # chiều vector scalar
+
+# action constants (đúng theo BTC)
+ACTION_STOP  = 0
+ACTION_LEFT  = 1
+ACTION_RIGHT = 2
+ACTION_UP    = 3
+ACTION_DOWN  = 4
+ACTION_BOMB  = 5
+
+MOVE_DELTAS = {
+    ACTION_LEFT:  ( 0, -1),
+    ACTION_RIGHT: ( 0,  1),
+    ACTION_UP:    (-1,  0),
+    ACTION_DOWN:  ( 1,  0),
+}
 
 
-GRID_SIZE   = 13    # kích thước bản đồ mặc định
-N_CHANNELS  = 5     # số kênh feature map
-
-
-def encode_state(obs: dict, agent_id: int) -> torch.Tensor:
+def encode_state(obs: dict, agent_id: int):
     """
-    Parameters
-    ----------
-    obs       : dict trả về từ env.step() / env.reset()
-                Giả sử có các key: 'board', 'bombs', 'agents', 'items', 'flames'
-    agent_id  : id agent hiện tại (0-3)
+    Trả về (spatial Tensor (9,13,13), scalar Tensor (9,))
 
-    Returns
-    -------
-    Tensor shape (N_CHANNELS, GRID_SIZE, GRID_SIZE) + scalar_vec (8,)
-    Trả về tuple (spatial_tensor, scalar_tensor)
+    Kênh spatial:
+      0  wall
+      1  box
+      2  item_radius
+      3  item_capacity
+      4  danger map  (bom + lửa, cường độ theo timer)
+      5  blast zone  (vùng nổ dự kiến của bom)
+      6  vị trí mình
+      7  vị trí địch (alive)
+      8  escape map  (BFS: số bước thoát được – chuẩn hóa)
     """
-    board = np.array(obs['board'], dtype=np.float32)   # (H, W)
-    H, W  = board.shape
+    board   = np.array(obs['map'],     dtype=np.int32)    # (13,13)
+    players = np.array(obs['players'], dtype=np.int32)    # (4,5)
+    bombs   = np.array(obs['bombs'],   dtype=np.int32)    # (N,4)
+    H, W    = board.shape
 
-    channels = np.zeros((N_CHANNELS, H, W), dtype=np.float32)
+    ch = np.zeros((N_CH, H, W), dtype=np.float32)
 
-    # --- Kênh 0: tường cứng ---
-    channels[0] = (board == TILE_WALL).astype(np.float32)
+    # ── Kênh 0-3: map tĩnh ──────────────────────────────────────────────
+    ch[0] = (board == TILE_WALL).astype(np.float32)
+    ch[1] = (board == TILE_BOX).astype(np.float32)
+    ch[2] = (board == TILE_ITEM_RAD).astype(np.float32)
+    ch[3] = (board == TILE_ITEM_CAP).astype(np.float32)
 
-    # --- Kênh 1: thùng (crates) ---
-    channels[1] = (board == TILE_CRATE).astype(np.float32)
+    # ── Kênh 4-5: bom ───────────────────────────────────────────────────
+    if bombs.ndim == 2 and len(bombs) > 0:
+        for b in bombs:
+            br, bc, timer, owner = int(b[0]), int(b[1]), int(b[2]), int(b[3])
+            # blast_radius = 1 + bonus của owner
+            owner_bonus = int(players[owner][4]) if 0 <= owner < 4 else 0
+            blast       = 1 + owner_bonus
 
-    # --- Kênh 2: nguy hiểm (bom + lửa) ---
-    for bomb in obs.get('bombs', []):
-        r, c   = bomb['position']
-        timer  = bomb['timer']          # càng nhỏ càng nguy hiểm
-        danger = 1.0 - timer / 10.0    # chuẩn hóa 0-1
-        channels[2][r][c] = max(channels[2][r][c], danger)
-        # đánh dấu bán kính nổ dự kiến
-        blast  = bomb.get('blast_strength', 3)
-        for dr, dc in [(0,1),(0,-1),(1,0),(-1,0)]:
-            for step in range(1, blast + 1):
-                nr, nc = r + dr * step, c + dc * step
-                if 0 <= nr < H and 0 <= nc < W:
+            # Kênh 4: danger (cường độ ~ urgency)
+            urgency = 1.0 - min(timer, 7) / 7.0   # timer 7→0, urgency 0→1
+            ch[4][br][bc] = max(ch[4][br][bc], urgency)
+
+            # Kênh 5: blast zone dự kiến
+            ch[5][br][bc] = 1.0
+            for dr, dc in [(-1,0),(1,0),(0,-1),(0,1)]:
+                for step in range(1, blast + 1):
+                    nr, nc = br + dr*step, bc + dc*step
+                    if not (0 <= nr < H and 0 <= nc < W):
+                        break
                     if board[nr][nc] == TILE_WALL:
                         break
-                    channels[2][nr][nc] = max(channels[2][nr][nc], danger * 0.8)
+                    ch[4][nr][nc] = max(ch[4][nr][nc], urgency * 0.9)
+                    ch[5][nr][nc] = 1.0
+                    if board[nr][nc] == TILE_BOX:
+                        break   # dừng tại box (phá box nhưng không xuyên qua)
 
-    for flame in obs.get('flames', []):
-        fr, fc = flame['position']
-        channels[2][fr][fc] = 1.0       # lửa = nguy hiểm tối đa
+    # ── Kênh 6: vị trí mình ─────────────────────────────────────────────
+    me = players[agent_id]
+    mr, mc = int(me[0]), int(me[1])
+    ch[6][mr][mc] = 1.0
 
-    # --- Kênh 3: vị trí agent mình ---
-    my_pos = obs['agents'][agent_id]['position']
-    channels[3][my_pos[0]][my_pos[1]] = 1.0
-
-    # --- Kênh 4: agent địch + vật phẩm ---
-    for aid, agent in enumerate(obs['agents']):
-        if aid == agent_id:
+    # ── Kênh 7: vị trí địch (alive) ─────────────────────────────────────
+    for i, p in enumerate(players):
+        if i == agent_id:
             continue
-        if agent.get('alive', True):
-            r, c = agent['position']
-            channels[4][r][c] = 1.0
+        if int(p[2]) == 1:   # alive
+            ch[7][int(p[0])][int(p[1])] = 1.0
 
-    for item in obs.get('items', []):
-        r, c = item['position']
-        channels[4][r][c] = 0.5   # vật phẩm dùng cường độ 0.5
+    # ── Kênh 8: escape map (BFS từ vị trí mình, chuẩn hóa) ──────────────
+    ch[8] = _escape_map(board, ch[4], (mr, mc), H, W)
 
-    spatial = torch.tensor(channels)  # (5, H, W)
+    spatial = torch.tensor(ch)   # (9,13,13)
 
-    # --- Vector scalar ---
-    my_info = obs['agents'][agent_id]
-    scalar  = torch.tensor([
-        my_pos[0] / H,
-        my_pos[1] / W,
-        my_info.get('bomb_count', 1)   / 5.0,
-        my_info.get('blast_strength', 2) / 10.0,
-        my_info.get('can_kick', 0),
-        float(is_in_danger(channels[2], my_pos)),
-        count_reachable_tiles(board, my_pos) / (H * W),
-        count_destroyable_crates(board, my_pos, my_info.get('blast_strength', 2)) / 20.0,
+    # ── Scalar vector ────────────────────────────────────────────────────
+    alive        = int(me[2])
+    bombs_left   = int(me[3])
+    radius_bonus = int(me[4])
+    blast_radius = 1 + radius_bonus
+
+    in_danger    = float(ch[4][mr][mc] > 0.3)
+    n_enemies    = int(sum(1 for i,p in enumerate(players)
+                          if i != agent_id and int(p[2]) == 1))
+    n_boxes      = int((board == TILE_BOX).sum())
+    destroyable  = float(_count_destroyable(board, (mr,mc), blast_radius, H, W))
+    escape_score = float(ch[8][mr][mc])
+
+    scalar = torch.tensor([
+        mr / H,
+        mc / W,
+        bombs_left   / 5.0,
+        blast_radius / 6.0,
+        in_danger,
+        n_enemies    / 3.0,
+        n_boxes      / 60.0,
+        destroyable  / 8.0,
+        escape_score,
     ], dtype=torch.float32)
 
     return spatial, scalar
 
 
-# ─── Tiện ích phụ ───────────────────────────────
+# ── Helpers ──────────────────────────────────────────────────────────────────
 
-def is_in_danger(danger_channel: np.ndarray, pos: tuple, threshold: float = 0.3) -> bool:
-    r, c = pos
-    return bool(danger_channel[r][c] > threshold)
-
-
-def count_reachable_tiles(board: np.ndarray, start: tuple, max_steps: int = 8) -> int:
-    """BFS đếm ô đi được trong max_steps bước."""
+def _escape_map(board, danger_ch, start, H, W):
+    """
+    BFS từ start, trả về ma trận (H,W):
+      ô = 1.0 nếu là ô an toàn gần nhất (danger < 0.3)
+      ô = 0.0 nếu không đi được hoặc chưa thăm
+    Chuẩn hóa bằng khoảng cách (gần = cao hơn).
+    """
     from collections import deque
-    H, W    = board.shape
-    visited = {start}
-    queue   = deque([(start, 0)])
-    count   = 0
+    dist   = np.full((H, W), -1, dtype=np.float32)
+    queue  = deque()
+    dist[start[0]][start[1]] = 0
+    queue.append(start)
+
     while queue:
-        (r, c), steps = queue.popleft()
-        count += 1
-        if steps >= max_steps:
-            continue
-        for dr, dc in [(0,1),(0,-1),(1,0),(-1,0)]:
-            nr, nc = r + dr, c + dc
+        r, c = queue.popleft()
+        for dr, dc in [(-1,0),(1,0),(0,-1),(0,1)]:
+            nr, nc = r+dr, c+dc
             if 0 <= nr < H and 0 <= nc < W:
-                if board[nr][nc] == TILE_EMPTY and (nr, nc) not in visited:
-                    visited.add((nr, nc))
-                    queue.append(((nr, nc), steps + 1))
-    return count
+                if dist[nr][nc] < 0 and board[nr][nc] in [TILE_GRASS, TILE_ITEM_RAD, TILE_ITEM_CAP]:
+                    dist[nr][nc] = dist[r][c] + 1
+                    queue.append((nr, nc))
+
+    result = np.zeros((H, W), dtype=np.float32)
+    # Đánh dấu ô an toàn với score tỷ lệ nghịch khoảng cách
+    for r in range(H):
+        for c in range(W):
+            if dist[r][c] >= 0 and danger_ch[r][c] < 0.3:
+                result[r][c] = 1.0 / (dist[r][c] + 1.0)
+    return result
 
 
-def count_destroyable_crates(board: np.ndarray, pos: tuple, blast: int) -> int:
-    """Đếm số thùng có thể phá nếu đặt bom tại pos."""
-    H, W  = board.shape
+def _count_destroyable(board, pos, blast, H, W):
     r0, c0 = pos
-    count = 0
-    for dr, dc in [(0,1),(0,-1),(1,0),(-1,0)]:
-        for step in range(1, blast + 1):
-            nr, nc = r0 + dr * step, c0 + dc * step
+    count  = 0
+    for dr, dc in [(-1,0),(1,0),(0,-1),(0,1)]:
+        for step in range(1, blast+1):
+            nr, nc = r0+dr*step, c0+dc*step
             if not (0 <= nr < H and 0 <= nc < W):
                 break
             if board[nr][nc] == TILE_WALL:
                 break
-            if board[nr][nc] == TILE_CRATE:
+            if board[nr][nc] == TILE_BOX:
                 count += 1
                 break
     return count

@@ -1,9 +1,8 @@
 """
-network.py  (đã fix bugs)
--------------------------
-Fix:
-  1. ResBlock forward: net[2] là ReLU chứ không phải Conv → dùng net[3]
-  2. import F lên đầu file
+network.py  –  Actor-Critic CNN cho BomIT
+-----------------------------------------
+Input: spatial (9,13,13) + scalar (9,)
+Output: logits (6,) + value (1,)
 """
 
 import torch
@@ -13,70 +12,54 @@ from torch.distributions import Categorical
 
 
 class ResBlock(nn.Module):
-    """Residual block nhỏ giúp gradient chảy tốt hơn khi train sâu."""
-    def __init__(self, channels: int):
+    def __init__(self, ch):
         super().__init__()
-        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1)
-        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1)
-        self.norm1 = nn.GroupNorm(1, channels)
-        self.norm2 = nn.GroupNorm(1, channels)
+        self.conv1 = nn.Conv2d(ch, ch, 3, padding=1)
+        self.conv2 = nn.Conv2d(ch, ch, 3, padding=1)
+        self.norm1 = nn.GroupNorm(min(8, ch), ch)
+        self.norm2 = nn.GroupNorm(min(8, ch), ch)
 
     def forward(self, x):
-        # FIX: dùng self.conv1/conv2 trực tiếp thay vì self.net[0]/self.net[2]
         out = F.relu(self.norm1(self.conv1(x)))
         out = self.norm2(self.conv2(out))
-        return F.relu(out + x)   # residual connection
+        return F.relu(out + x)
 
 
 class BomberNet(nn.Module):
-    """
-    Actor-Critic network cho BomIT agent.
+    N_ACTIONS = 6   # STOP LEFT RIGHT UP DOWN BOMB
+    N_SPATIAL = 9   # kênh input
+    N_SCALAR  = 9   # scalar dim
 
-    Input:
-      spatial : (B, 5, H, W)   – feature map 5 kênh
-      scalar  : (B, 8)          – scalar stats của agent
-
-    Output:
-      logits  : (B, n_actions)  – logits cho Actor
-      value   : (B, 1)          – state value cho Critic
-    """
-
-    N_ACTIONS = 6   # STOP, UP, DOWN, LEFT, RIGHT, BOMB
-
-    def __init__(self, grid_size: int = 13, scalar_dim: int = 8):
+    def __init__(self):
         super().__init__()
-        self.grid_size  = grid_size
-        self.scalar_dim = scalar_dim
 
-        # ── CNN backbone ──────────────────────────────
+        # ── CNN backbone ─────────────────────────────────────────────────
         self.cnn = nn.Sequential(
-            nn.Conv2d(5, 32, kernel_size=3, padding=1),
+            nn.Conv2d(self.N_SPATIAL, 32, 3, padding=1),
             nn.GroupNorm(4, 32),
             nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.Conv2d(32, 64, 3, padding=1),
             nn.GroupNorm(8, 64),
             nn.ReLU(),
             ResBlock(64),
-            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            ResBlock(64),
+            nn.Conv2d(64, 64, 3, padding=1),
             nn.GroupNorm(8, 64),
             nn.ReLU(),
-            nn.AdaptiveAvgPool2d((4, 4)),
+            nn.AdaptiveAvgPool2d((4, 4)),   # → (64,4,4) = 1024
         )
-        cnn_out = 64 * 4 * 4   # 1024
 
-        # ── Scalar MLP ────────────────────────────────
-        self.scalar_mlp = nn.Sequential(
-            nn.Linear(scalar_dim, 64),
+        # ── Scalar MLP ───────────────────────────────────────────────────
+        self.scalar_net = nn.Sequential(
+            nn.Linear(self.N_SCALAR, 64),
             nn.ReLU(),
             nn.Linear(64, 64),
             nn.ReLU(),
         )
 
-        # ── Fusion + heads ────────────────────────────
-        fusion_dim = cnn_out + 64   # 1088
-
+        # ── Fusion ───────────────────────────────────────────────────────
         self.fusion = nn.Sequential(
-            nn.Linear(fusion_dim, 512),
+            nn.Linear(1024 + 64, 512),
             nn.ReLU(),
             nn.Linear(512, 256),
             nn.ReLU(),
@@ -84,7 +67,6 @@ class BomberNet(nn.Module):
 
         self.actor_head  = nn.Linear(256, self.N_ACTIONS)
         self.critic_head = nn.Linear(256, 1)
-
         self._init_weights()
 
     def _init_weights(self):
@@ -95,30 +77,28 @@ class BomberNet(nn.Module):
                     nn.init.zeros_(m.bias)
         nn.init.orthogonal_(self.actor_head.weight, gain=0.01)
 
-    def forward(self, spatial: torch.Tensor, scalar: torch.Tensor):
-        cnn_feat = self.cnn(spatial)
-        cnn_flat = cnn_feat.view(cnn_feat.size(0), -1)
-        sc_feat  = self.scalar_mlp(scalar)
-        fused    = torch.cat([cnn_flat, sc_feat], dim=1)
-        feat     = self.fusion(fused)
-        logits   = self.actor_head(feat)
-        value    = self.critic_head(feat)
-        return logits, value
+    def forward(self, sp, sc):
+        feat = self.cnn(sp).view(sp.size(0), -1)
+        feat = torch.cat([feat, self.scalar_net(sc)], dim=1)
+        feat = self.fusion(feat)
+        return self.actor_head(feat), self.critic_head(feat)
 
-    def get_action(self, spatial: torch.Tensor, scalar: torch.Tensor,
-                   deterministic: bool = False):
+    def get_action(self, sp, sc, mask=None, deterministic=False):
         """
+        mask: BoolTensor (B, N_ACTIONS) – True = action bị cấm
         Returns (action_int, log_prob_tensor, entropy_tensor, value_tensor)
-        FIX: trả về Tensor (không .item()) để buffer có thể torch.stack
         """
         with torch.no_grad():
-            logits, value = self.forward(spatial, scalar)
+            logits, value = self.forward(sp, sc)
+        if mask is not None:
+            logits = logits.masked_fill(mask, -1e9)
         dist   = Categorical(logits=logits)
-        action = logits.argmax(dim=-1) if deterministic else dist.sample()
+        action = logits.argmax(-1) if deterministic else dist.sample()
         return action.item(), dist.log_prob(action), dist.entropy(), value
 
-    def evaluate_actions(self, spatial: torch.Tensor, scalar: torch.Tensor,
-                         actions: torch.Tensor):
-        logits, value = self.forward(spatial, scalar)
-        dist          = Categorical(logits=logits)
+    def evaluate_actions(self, sp, sc, actions, mask=None):
+        logits, value = self.forward(sp, sc)
+        if mask is not None:
+            logits = logits.masked_fill(mask, -1e9)
+        dist = Categorical(logits=logits)
         return dist.log_prob(actions), dist.entropy(), value.squeeze(-1)
