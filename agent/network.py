@@ -1,16 +1,9 @@
 """
-network.py
-----------
-Kiến trúc mạng Actor-Critic dùng cho PPO.
-
-Thiết kế:
-  1. CNN backbone xử lý spatial features (5 kênh)
-  2. MLP nhỏ xử lý scalar features
-  3. Fusion layer kết hợp cả hai
-  4. Tách thành 2 đầu: Actor (policy) + Critic (value)
-
-Lý do chọn CNN: bản đồ Bomberman có cấu trúc không gian rõ ràng,
-CNN học được pattern "bom gần → nguy hiểm" tốt hơn MLP thuần.
+network.py  (đã fix bugs)
+-------------------------
+Fix:
+  1. ResBlock forward: net[2] là ReLU chứ không phải Conv → dùng net[3]
+  2. import F lên đầu file
 """
 
 import torch
@@ -23,21 +16,16 @@ class ResBlock(nn.Module):
     """Residual block nhỏ giúp gradient chảy tốt hơn khi train sâu."""
     def __init__(self, channels: int):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(channels, channels, 3, padding=1),
-            nn.LayerNorm([channels, 1, 1]),   # sẽ broadcast
-            nn.ReLU(),
-            nn.Conv2d(channels, channels, 3, padding=1),
-        )
-        # dùng LayerNorm trên channel dimension
+        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1)
+        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1)
         self.norm1 = nn.GroupNorm(1, channels)
         self.norm2 = nn.GroupNorm(1, channels)
 
     def forward(self, x):
-        residual = x
-        out = F.relu(self.norm1(self.net[0](x)))
-        out = self.norm2(self.net[2](out))
-        return F.relu(out + residual)
+        # FIX: dùng self.conv1/conv2 trực tiếp thay vì self.net[0]/self.net[2]
+        out = F.relu(self.norm1(self.conv1(x)))
+        out = self.norm2(self.conv2(out))
+        return F.relu(out + x)   # residual connection
 
 
 class BomberNet(nn.Module):
@@ -49,7 +37,7 @@ class BomberNet(nn.Module):
       scalar  : (B, 8)          – scalar stats của agent
 
     Output:
-      logits  : (B, n_actions)  – log-probabilities cho Actor
+      logits  : (B, n_actions)  – logits cho Actor
       value   : (B, 1)          – state value cho Critic
     """
 
@@ -62,17 +50,17 @@ class BomberNet(nn.Module):
 
         # ── CNN backbone ──────────────────────────────
         self.cnn = nn.Sequential(
-            nn.Conv2d(5, 32, kernel_size=3, padding=1),   # (B,32,13,13)
+            nn.Conv2d(5, 32, kernel_size=3, padding=1),
             nn.GroupNorm(4, 32),
             nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),  # (B,64,13,13)
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
             nn.GroupNorm(8, 64),
             nn.ReLU(),
             ResBlock(64),
             nn.Conv2d(64, 64, kernel_size=3, padding=1),
             nn.GroupNorm(8, 64),
             nn.ReLU(),
-            nn.AdaptiveAvgPool2d((4, 4)),                  # (B,64,4,4)
+            nn.AdaptiveAvgPool2d((4, 4)),
         )
         cnn_out = 64 * 4 * 4   # 1024
 
@@ -85,7 +73,7 @@ class BomberNet(nn.Module):
         )
 
         # ── Fusion + heads ────────────────────────────
-        fusion_dim = cnn_out + 64    # 1088
+        fusion_dim = cnn_out + 64   # 1088
 
         self.fusion = nn.Sequential(
             nn.Linear(fusion_dim, 512),
@@ -105,45 +93,32 @@ class BomberNet(nn.Module):
                 nn.init.orthogonal_(m.weight, gain=1.0)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-        # actor head khởi tạo nhỏ để tránh policy collapse
         nn.init.orthogonal_(self.actor_head.weight, gain=0.01)
 
     def forward(self, spatial: torch.Tensor, scalar: torch.Tensor):
-        # CNN path
-        cnn_feat = self.cnn(spatial)                          # (B,64,4,4)
-        cnn_flat = cnn_feat.view(cnn_feat.size(0), -1)       # (B,1024)
-
-        # Scalar path
-        sc_feat  = self.scalar_mlp(scalar)                   # (B,64)
-
-        # Fusion
-        fused    = torch.cat([cnn_flat, sc_feat], dim=1)     # (B,1088)
-        feat     = self.fusion(fused)                         # (B,256)
-
-        logits   = self.actor_head(feat)                      # (B,6)
-        value    = self.critic_head(feat)                     # (B,1)
+        cnn_feat = self.cnn(spatial)
+        cnn_flat = cnn_feat.view(cnn_feat.size(0), -1)
+        sc_feat  = self.scalar_mlp(scalar)
+        fused    = torch.cat([cnn_flat, sc_feat], dim=1)
+        feat     = self.fusion(fused)
+        logits   = self.actor_head(feat)
+        value    = self.critic_head(feat)
         return logits, value
 
     def get_action(self, spatial: torch.Tensor, scalar: torch.Tensor,
                    deterministic: bool = False):
         """
-        Sample 1 action (dùng lúc inference).
-        Returns (action_int, log_prob, entropy, value)
+        Returns (action_int, log_prob_tensor, entropy_tensor, value_tensor)
+        FIX: trả về Tensor (không .item()) để buffer có thể torch.stack
         """
         with torch.no_grad():
             logits, value = self.forward(spatial, scalar)
-        dist     = Categorical(logits=logits)
-        if deterministic:
-            action = logits.argmax(dim=-1)
-        else:
-            action = dist.sample()
+        dist   = Categorical(logits=logits)
+        action = logits.argmax(dim=-1) if deterministic else dist.sample()
         return action.item(), dist.log_prob(action), dist.entropy(), value
 
     def evaluate_actions(self, spatial: torch.Tensor, scalar: torch.Tensor,
                          actions: torch.Tensor):
-        """Dùng lúc update PPO."""
         logits, value = self.forward(spatial, scalar)
         dist          = Categorical(logits=logits)
-        log_probs     = dist.log_prob(actions)
-        entropy       = dist.entropy()
-        return log_probs, entropy, value.squeeze(-1)
+        return dist.log_prob(actions), dist.entropy(), value.squeeze(-1)
